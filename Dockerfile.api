@@ -1,0 +1,25 @@
+# FinAlze API image — slim (no ML stack), multi-stage, non-root.
+# syntax=docker/dockerfile:1
+FROM python:3.13-slim AS deps
+ENV PIP_NO_CACHE_DIR=1
+WORKDIR /app
+COPY requirements-api.txt .
+RUN pip install --no-cache-dir -r requirements-api.txt
+
+FROM python:3.13-slim AS runtime
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/src
+WORKDIR /app
+# non-root
+RUN useradd -m -u 10001 appuser
+# bring in installed site-packages + console scripts
+COPY --from=deps /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=deps /usr/local/bin /usr/local/bin
+COPY src/ /app/src/
+COPY alembic/ /app/alembic/
+COPY alembic.ini /app/alembic.ini
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=15s --timeout=3s --retries=10 \
+  CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz').status==200 else 1)"
+# Dev: create_all + bootstrap admin, then serve. (Prod: replace bootstrap with `alembic upgrade head`.)
+CMD ["sh", "-c", "python -m api.bootstrap && uvicorn api.main:app --host 0.0.0.0 --port 8000 --forwarded-allow-ips='*'"]
