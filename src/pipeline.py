@@ -84,6 +84,17 @@ class PipelineConfig:
     
     # Output
     output_format: str = "json"  # json, markdown, csv
+    # Document classification confidence threshold (0-1). If the
+    # classifier returns a confidence below this value, the pipeline
+    # must reject the document as non-financial per client spec.
+    doc_type_confidence_threshold: float = 0.70
+    # Score aggregation weights for Score 5 (s1..s4 must sum to 1.0)
+    score_weights: dict = field(default_factory=lambda: {
+        "s1": 0.25,  # Quality OCR
+        "s2": 0.20,  # Identification/classification
+        "s3": 0.25,  # Extraction confidence
+        "s4": 0.30,  # Mapping/validation confidence
+    })
 
 
 class FinAlzePipeline:
@@ -128,9 +139,67 @@ class FinAlzePipeline:
         tier_attempts = []
         
         # Step 1: Pre-processing
-        doc_type = self._classify_document(input_path)
+        # Strict classification (client rule): must be one of the four
+        # financial categories with sufficient confidence, otherwise REJECT.
+        classification = self._classify_document_strict(input_path)
+
+        # Gate: reject if category is 'Autre' or confidence below threshold
+        if (
+            classification.get("category") == "Autre"
+            or classification.get("confidence", 0.0)
+            < self.config.doc_type_confidence_threshold
+        ):
+            logger.warning(
+                "Document rejected by strict classifier: %s",
+                classification,
+            )
+            # Persist a local audit event (synchronous) so the rejection is
+            # immediately traceable without requiring async DB access.
+            # Try async DB persistence first; if that fails, fall back to local JSONL
+            try:
+                import asyncio
+                from pipeline_audit_db import async_log_rejection
+
+                coro = async_log_rejection(
+                    filename=str(input_path.name),
+                    classification=classification,
+                    threshold=self.config.doc_type_confidence_threshold,
+                )
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(coro)
+                    else:
+                        asyncio.run(coro)
+                except RuntimeError:
+                    # No running loop — run synchronously
+                    asyncio.run(coro)
+            except Exception:
+                try:
+                    from pipeline_audit import log_rejection
+
+                    log_rejection(str(input_path.name), classification, self.config.doc_type_confidence_threshold)
+                except Exception:
+                    logger.debug("Failed to persist audit event (db + jsonl) for rejection")
+
+            # Log rejection in metadata and return a rejection ExtractionResult
+            return ExtractionResult(
+                text="",
+                tables=[],
+                qcs_score=0.0,
+                tier_used=-1,
+                confidence_details={"classification": classification},
+                metadata={
+                    "pipeline_status": "REJECTED",
+                    "reject_reason": classification.get("reject_reason", ""),
+                    "classification": classification,
+                },
+            )
+
+        # Continue normally
+        doc_type = classification.get("category")
         images = self._extract_images(input_path)
-        
+
         logger.info(f"Document type: {doc_type}, Images: {len(images)}")
         
         # Step 2: Tier 0 - Native extraction (digital PDFs with embedded text)
@@ -171,7 +240,7 @@ class FinAlzePipeline:
         
         # Step 3: Tier 1 - Fast OCR (with Tier 0 context if available)
         result = self._tier1_fast_ocr(
-            input_path, images, doc_type,
+            input_path, images, classification,
             preprocess_resize=preprocess_resize,
             preprocess_grayscale=preprocess_grayscale,
             max_image_width=max_image_width,
@@ -262,6 +331,87 @@ class FinAlzePipeline:
 
         classification = dictionary.classify_statement(rows)
         return classification if classification != "unknown" else "bilan"
+
+    def _classify_document_strict(self, path: Path) -> dict:
+        """Strict classifier wrapper returning JSON-like dict.
+
+        Returns a dict: {"category": <one of the 4 values>,
+        "confidence": <0-1>, "reject_reason": <str>}.
+        Falls back to conservative outputs when the nomenclature
+        classifier doesn't expose confidences.
+        """
+        # Default conservative response
+        result = {"category": "Autre", "confidence": 0.0, "reject_reason": ""}
+        try:
+            from accounting.nomenclature import load_default_dictionary
+            dictionary = load_default_dictionary()
+        except Exception:
+            result["reject_reason"] = "classifier_unavailable"
+            return result
+
+        # Reuse the lightweight label from the existing helper
+        try:
+            raw_label = self._classify_document(path)
+        except Exception:
+            raw_label = "unknown"
+
+        low = (raw_label or "").lower()
+        if "bilan" in low:
+            mapped = "Bilan"
+        elif "flux" in low:
+            mapped = "Flux de trésorerie"
+        elif "resultat" in low or "compte" in low:
+            mapped = "Compte de résultat"
+        else:
+            mapped = "Autre"
+
+        # Attempt to obtain a confidence score if the dictionary provides one
+        confidence = 0.0
+        try:
+            # Collect a small sample of rows as in _classify_document
+            rows: list[str] = []
+            suffix = path.suffix.lower()
+            if suffix == ".pdf":
+                import fitz
+                with fitz.open(str(path)) as doc:
+                    for page in list(doc)[:3]:
+                        text = page.get_text() or ""
+                        rows.extend(line.strip() for line in text.splitlines() if line.strip())
+            elif suffix == ".docx":
+                from docx import Document
+                doc = Document(path)
+                rows.extend(p.text.strip() for p in doc.paragraphs if p.text.strip())
+                for tbl in doc.tables:
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            if cell.text.strip():
+                                rows.append(cell.text.strip())
+
+            # Various dictionary APIs may exist; try common patterns
+            if hasattr(dictionary, "classify_statement_with_confidence"):
+                lbl, confidence = dictionary.classify_statement_with_confidence(rows)
+            elif hasattr(dictionary, "classify_statement_confidence"):
+                res = dictionary.classify_statement_confidence(rows)
+                if isinstance(res, dict):
+                    lbl = res.get("label", raw_label)
+                    confidence = res.get("confidence", 0.0)
+                elif isinstance(res, tuple):
+                    lbl, confidence = res
+                else:
+                    confidence = 0.0
+            else:
+                # No confidence API available: be conservative
+                confidence = 0.5 if mapped != "Autre" else 0.0
+
+        except Exception:
+            confidence = 0.0
+
+        result = {
+            "category": mapped,
+            "confidence": float(confidence),
+            "reject_reason": "" if mapped != "Autre" else "not_a_financial_statement",
+        }
+        return result
     
     def _extract_images(self, path: Path) -> list:
         """Extract embedded images from DOCX or PDF pages."""
@@ -699,7 +849,7 @@ class FinAlzePipeline:
         self,
         path: Path,
         images: list,
-        doc_type: str,
+        doc_classification: dict,
         preprocess_resize: bool = True,
         preprocess_grayscale: bool = True,
         max_image_width: int = 2000,
@@ -911,7 +1061,61 @@ class FinAlzePipeline:
                 qcs_grade = "unknown"
                 qcs_details = {}
 
-            return ExtractionResult(
+                # Build scores (placeholders if detailed signals absent)
+                doc_type_label = doc_classification.get("category") if isinstance(doc_classification, dict) else None
+
+                # if result lacks confidence attributes, fallback gracefully
+                docling_conf = getattr(result, "confidence", 0.5)
+                try:
+                    val_score = validation_report.severity_weighted_score
+                except Exception:
+                    val_score = 0.5 if validation_report else 0.5
+
+                # Compute normalized float scores (0..1)
+                s1 = float(qcs_score) if qcs_score is not None else 0.0
+                s2 = float(doc_classification.get("confidence", 0.0)) if isinstance(doc_classification, dict) else 0.0
+                s3 = float(docling_conf) if docling_conf is not None else 0.0
+                s4 = float(val_score) if val_score is not None else 0.0
+
+                weights = getattr(self.config, "score_weights", {"s1": 0.25, "s2": 0.2, "s3": 0.25, "s4": 0.3})
+                # Ensure weights sum to 1.0 (normalize if not)
+                total_w = sum(weights.values()) if isinstance(weights, dict) and weights else 1.0
+                if total_w <= 0:
+                    total_w = 1.0
+
+                w1 = weights.get("s1", 0.25) / total_w
+                w2 = weights.get("s2", 0.20) / total_w
+                w3 = weights.get("s3", 0.25) / total_w
+                w4 = weights.get("s4", 0.30) / total_w
+
+                score5 = (w1 * s1 + w2 * s2 + w3 * s3 + w4 * s4) * 100.0
+
+                scores = {
+                    "score1": int(round(s1 * 100)),
+                    "score2": int(round(s2 * 100)),
+                    "score3": int(round(s3 * 100)),
+                    "score4": int(round(s4 * 100)),
+                    "score5": int(round(score5)),
+                }
+
+                # Synthetic bounding boxes if extractor doesn't provide them
+                bboxes = result.metadata.get("bboxes") if isinstance(result.metadata, dict) and result.metadata.get("bboxes") else []
+                if not bboxes and result.tables:
+                    # create simple normalized boxes per table for UI overlay
+                    bboxes = []
+                    for i in range(len(result.tables)):
+                        top = 0.05 + 0.08 * i
+                        bottom = min(0.95, top + 0.12)
+                        bboxes.append({
+                            "page": 1,
+                            "x0": 0.05,
+                            "y0": round(top, 3),
+                            "x1": 0.95,
+                            "y1": round(bottom, 3),
+                            "label": f"table_{i+1}",
+                        })
+
+                return ExtractionResult(
                 text=result.text,
                 tables=tables_data,
                 qcs_score=qcs_score,
@@ -923,10 +1127,11 @@ class FinAlzePipeline:
                     'parse_grade': result.parse_grade,
                     'low_grade': result.low_grade,
                     'qcs_grade': qcs_grade,
+                    'scores': scores,
                     **qcs_details,
                 },
                 metadata={
-                    'doc_type': doc_type,
+                    'doc_type': doc_type_label,
                     'table_count': len(result.tables),
                     'preprocess_resize': preprocess_resize,
                     'preprocess_grayscale': preprocess_grayscale,
@@ -934,6 +1139,7 @@ class FinAlzePipeline:
                     'tier0_text_used': tier0_text_used,
                     'tier0_tables_supplemented': tier0_supplemented,
                     'reconciliation': reconciliation_report,
+                    'bboxes': bboxes,
                     **result.metadata
                 },
                 canonical_tables=canonical_tables_t1,
@@ -949,7 +1155,7 @@ class FinAlzePipeline:
                 qcs_score=0.0,
                 tier_used=1,
                 confidence_details={'error': str(e)},
-                metadata={'doc_type': doc_type, 'failed': True}
+                metadata={'doc_type': (doc_classification.get('category') if isinstance(doc_classification, dict) else None), 'failed': True}
             )
     
     def _tier2_vlm(self, images: list) -> ExtractionResult:

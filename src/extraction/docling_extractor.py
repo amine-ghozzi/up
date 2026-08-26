@@ -248,6 +248,7 @@ class DoclingExtractor:
 
         # Collect table confidence scores
         table_confidences = []
+        bboxes = []
 
         for table in doc.tables:
             try:
@@ -259,6 +260,32 @@ class DoclingExtractor:
 
                 tables.append(df)
 
+                # Attempt to extract bounding box info from table object
+                try:
+                    bbox = None
+                    page = None
+                    # Common attribute names
+                    if hasattr(table, 'bbox'):
+                        bbox = getattr(table, 'bbox')
+                    elif hasattr(table, 'bbox_norm'):
+                        bbox = getattr(table, 'bbox_norm')
+                    elif hasattr(table, 'coords'):
+                        bbox = getattr(table, 'coords')
+
+                    if hasattr(table, 'page'):
+                        page = getattr(table, 'page')
+                    elif hasattr(table, 'page_index'):
+                        page = getattr(table, 'page_index')
+
+                    if bbox is not None:
+                        # bbox may be (x0,y0,x1,y1) in absolute units or normalized
+                        table_conf = {
+                            "page": int(page) if page is not None else 1,
+                            "bbox": bbox,
+                        }
+                        bboxes.append(table_conf)
+                except Exception:
+                    pass
                 # Try to get table-level confidence from prov (provenance)
                 if hasattr(table, 'prov') and table.prov:
                     for prov in table.prov:
@@ -382,6 +409,7 @@ class DoclingExtractor:
                 "table_samples": len(table_confidences),
                 "correction_stats": correction_stats,
                 "quality_report_available": quality_report is not None,
+                "bboxes": bboxes,
             }
         )
 

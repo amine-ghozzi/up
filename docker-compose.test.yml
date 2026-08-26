@@ -1,0 +1,64 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment: {POSTGRES_USER: finalze, POSTGRES_PASSWORD: finalze, POSTGRES_DB: finalze}
+    volumes: ["pgdata_test:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U finalze -d finalze"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    volumes: ["redisdata_test:/data"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 12}
+
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    ports: ["15672:15672"]
+    volumes: ["rabbitmqdata_test:/var/lib/rabbitmq"]
+    healthcheck: {test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"], interval: 10s, timeout: 5s, retries: 12}
+
+  minio:
+    image: minio/minio
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment: {MINIO_ROOT_USER: minioadmin, MINIO_ROOT_PASSWORD: minioadmin}
+    ports: ["9001:9001"]
+    volumes: ["miniodata_test:/data"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  tests:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      FINALZE_DATABASE_URL: postgresql+asyncpg://finalze:finalze@postgres:5432/finalze
+      FINALZE_REDIS_URL: redis://redis:6379/0
+      FINALZE_BROKER_URL: amqp://guest:guest@rabbitmq:5672//
+      FINALZE_RESULT_BACKEND_URL: redis://redis:6379/1
+      FINALZE_S3_ENDPOINT_URL: http://minio:9000
+      FINALZE_S3_ACCESS_KEY: minioadmin
+      FINALZE_S3_SECRET_KEY: minioadmin
+      FINALZE_S3_BUCKET: finalze-documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+volumes:
+  pgdata_test:
+  redisdata_test:
+  rabbitmqdata_test:
+  miniodata_test:

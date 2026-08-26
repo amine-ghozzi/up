@@ -1,0 +1,14 @@
+FROM python:3.13-slim
+ENV PIP_NO_CACHE_DIR=1 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/app/src
+WORKDIR /app
+
+# Install API deps (async DB drivers, FastAPI utils) and light test deps
+COPY requirements-api.txt /app/requirements-api.txt
+RUN pip install --no-cache-dir -r /app/requirements-api.txt \
+    && pip install --no-cache-dir pytest pytest-asyncio pillow pandas rapidfuzz
+
+# Copy source + tests
+COPY src/ /app/src/
+COPY tests/ /app/tests/
+
+CMD ["pytest", "-q"]

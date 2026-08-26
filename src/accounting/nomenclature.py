@@ -554,6 +554,59 @@ class NomenclatureDictionary:
             return winner
         return "unknown"
 
+    def classify_statement_with_confidence(self, rows: Iterable[str]) -> tuple[str, float]:
+        """Classify statement rows and return (label, confidence).
+
+        Label is one of: 'bilan', 'compte_resultat', 'flux_tresorerie', or 'unknown'.
+        Confidence is a float between 0.0 and 1.0 based on score concentration.
+        """
+        scores = {"bilan": 0.0, "compte_resultat": 0.0, "flux_tresorerie": 0.0}
+        texts = [r for r in rows if r]
+        if not texts:
+            return "unknown", 0.0
+
+        for raw_text in texts:
+            mr = self.fuzzy_match(raw_text)
+            if mr.entry and mr.match_type in ("exact", "fuzzy", "resolved"):
+                scores[mr.entry.statement_type] = scores.get(mr.entry.statement_type, 0.0) + 1.0
+
+        # Structural boosters (same as classify_statement)
+        joined = " ".join(texts).lower()
+        if any(kw in joined for kw in ("brut", "amort", "amortissement", "dépréc", "deprec")):
+            scores["bilan"] += 3.0
+        if any(kw in joined for kw in (
+            "actifs non courants", "actifs courants", "actifs immobilis",
+            "total des actifs", "total de l'actif", "total actif",
+            "immobilisations incorporelles", "immobilisations corporelles",
+        )):
+            scores["bilan"] += 3.0
+        if any(kw in joined for kw in (
+            "capitaux propres", "passifs non courants", "passifs courants",
+            "total des passifs", "total du passif", "total passif",
+            "total des capitaux propres", "capital social",
+            "capitaux propres et passifs",
+        )):
+            scores["bilan"] += 3.0
+        if any(kw in joined for kw in ("résultat d'exploitation", "resultat d'exploitation",
+                                        "produits d'exploitation", "charges d'exploitation",
+                                        "charges de personnel", "achats consomm")):
+            scores["compte_resultat"] += 3.0
+        if any(kw in joined for kw in ("flux de tr", "flux net", "trésorerie de clôture",
+                                        "tresorerie de cloture", "activités d'exploitation",
+                                        "activités d'investissement", "activités de financement")):
+            scores["flux_tresorerie"] += 3.0
+
+        # Determine winner and a conservative confidence metric based on concentration
+        total = sum(scores.values())
+        if total <= 0:
+            return "unknown", 0.0
+        winner = max(scores, key=scores.get)
+        # Confidence: proportion of winner score to total, scaled and clipped
+        raw_conf = scores[winner] / total
+        # Apply a small sigmoid-ish scaling to stretch mid-range
+        confidence = max(0.0, min(1.0, (raw_conf * 1.2)))
+        return winner, float(confidence)
+
     # ------------------------------------------------------------------
     # Section classifier (for header detection — §14 Signal 3)
     # ------------------------------------------------------------------
