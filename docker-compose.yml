@@ -97,6 +97,16 @@ services:
     volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
     depends_on: [api]
 
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports: ["3000:3000"]
+    environment:
+      - NEXT_PUBLIC_API_URL=http://api:8000
+    depends_on:
+      - api
+
   # Tier-2 GPU worker — opt-in (`--profile gpu`). Pair with a vLLM service serving Qwen2.5-VL.
   worker-gpu:
     profiles: ["gpu"]

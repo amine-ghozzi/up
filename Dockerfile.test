@@ -5,7 +5,7 @@ WORKDIR /app
 # Install API deps (async DB drivers, FastAPI utils) and light test deps
 COPY requirements-api.txt /app/requirements-api.txt
 RUN pip install --no-cache-dir -r /app/requirements-api.txt \
-    && pip install --no-cache-dir pytest pytest-asyncio pillow pandas rapidfuzz
+    && pip install --no-cache-dir pytest pytest-asyncio pillow pandas rapidfuzz Babel
 
 # Copy source + tests
 COPY src/ /app/src/

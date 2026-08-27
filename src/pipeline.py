@@ -247,6 +247,56 @@ class FinAlzePipeline:
             accounting_standard=accounting_standard,
             tier0_result=tier0_result,
         )
+        # Ensure `scores` are present for downstream logic / UI/tests
+        try:
+            cd = result.confidence_details if isinstance(result.confidence_details, dict) else {}
+            # Recompute and enforce `scores` to ensure consistency with res.qcs_score
+            # (override any upstream `scores` from qcs internals)
+            qcs_score = getattr(result, 'qcs_score', 0.0) or 0.0
+            doc_conf = classification.get('confidence', 0.0) if isinstance(classification, dict) else 0.0
+            docling_conf = getattr(result, 'confidence', 0.5) or 0.5
+            val_score = None
+            try:
+                vr = (result.metadata or {}).get('validation_report')
+                if isinstance(vr, dict) and 'severity_weighted_score' in vr:
+                    val_score = vr.get('severity_weighted_score')
+            except Exception:
+                val_score = None
+            if val_score is None:
+                try:
+                    val_score = result.metadata.get('validation_report', {}).get('severity_weighted_score') if result.metadata else 0.5
+                except Exception:
+                    val_score = 0.5
+
+            s1 = float(qcs_score)
+            s2 = float(doc_conf)
+            s3 = float(docling_conf)
+            s4 = float(val_score) if val_score is not None else 0.5
+
+            weights = getattr(self.config, 'score_weights', {'s1': 0.25, 's2': 0.2, 's3': 0.25, 's4': 0.3})
+            print("CONFIG_SCORE_WEIGHTS:", repr(getattr(self.config, 'score_weights', None)))
+            logger.info("Score weights for aggregation: %s", weights)
+            total_w = sum(weights.values()) if isinstance(weights, dict) and weights else 1.0
+            if total_w <= 0:
+                total_w = 1.0
+            w1 = weights.get('s1', 0.25) / total_w
+            w2 = weights.get('s2', 0.20) / total_w
+            w3 = weights.get('s3', 0.25) / total_w
+            w4 = weights.get('s4', 0.30) / total_w
+
+            score5 = (w1 * s1 + w2 * s2 + w3 * s3 + w4 * s4) * 100.0
+            scores = {
+                'score1': int(round(s1 * 100)),
+                'score2': int(round(s2 * 100)),
+                'score3': int(round(s3 * 100)),
+                'score4': int(round(s4 * 100)),
+                'score5': int(round(score5)),
+            }
+            logger.info("Score components: s1=%.3f s2=%.3f s3=%.3f s4=%.3f score5=%.1f", s1, s2, s3, s4, score5)
+            if isinstance(result.confidence_details, dict):
+                result.confidence_details['scores'] = scores
+        except Exception:
+            pass
         tier_attempts.append({
             "tier": 1, 
             "name": "Docling OCR", 
@@ -789,6 +839,49 @@ class FinAlzePipeline:
                 qcs_score = qcs_report.qcs_score
                 qcs_grade = qcs_report.grade
                 qcs_details = qcs_report.to_dict()
+
+                # Ensure backward-compatible `scores` field exists for UI/tests
+                try:
+                    if not isinstance(qcs_details, dict):
+                        qcs_details = dict(qcs_details)
+
+                    if 'scores' not in qcs_details:
+                        doc_type_label = doc_classification.get("category") if isinstance(doc_classification, dict) else None
+                        docling_conf = getattr(result, "confidence", 0.5)
+                        try:
+                            val_score = validation_report.severity_weighted_score
+                        except Exception:
+                            val_score = 0.5 if validation_report else 0.5
+
+                        s1 = float(qcs_score) if qcs_score is not None else 0.0
+                        s2 = float(doc_classification.get("confidence", 0.0)) if isinstance(doc_classification, dict) else 0.0
+                        s3 = float(docling_conf) if docling_conf is not None else 0.0
+                        s4 = float(val_score) if val_score is not None else 0.0
+
+                        weights = getattr(self.config, "score_weights", {"s1": 0.25, "s2": 0.2, "s3": 0.25, "s4": 0.3})
+                        total_w = sum(weights.values()) if isinstance(weights, dict) and weights else 1.0
+                        if total_w <= 0:
+                            total_w = 1.0
+
+                        w1 = weights.get("s1", 0.25) / total_w
+                        w2 = weights.get("s2", 0.20) / total_w
+                        w3 = weights.get("s3", 0.25) / total_w
+                        w4 = weights.get("s4", 0.30) / total_w
+
+                        score5 = (w1 * s1 + w2 * s2 + w3 * s3 + w4 * s4) * 100.0
+
+                        scores = {
+                            "score1": int(round(s1 * 100)),
+                            "score2": int(round(s2 * 100)),
+                            "score3": int(round(s3 * 100)),
+                            "score4": int(round(s4 * 100)),
+                            "score5": int(round(score5)),
+                        }
+
+                        qcs_details["scores"] = scores
+                except Exception:
+                    # Non-fatal: keep original qcs_details if computation fails
+                    pass
             except ImportError:
                 qcs_score = 0.95 if validation_report and validation_report.overall_passed else 0.5
                 qcs_grade = "excellent" if qcs_score >= 0.90 else "good"
@@ -919,7 +1012,14 @@ class FinAlzePipeline:
 
             # Convert tables to list of dicts for JSON serialization
             tables_data = []
+            import pandas as pd
             for df in result.tables:
+                if not isinstance(df, pd.DataFrame):
+                    try:
+                        df = pd.DataFrame(df)
+                    except Exception:
+                        # Skip unconvertible table entries
+                        continue
                 tables_data.append(df.to_dict(orient='records'))
 
             # =============================================================

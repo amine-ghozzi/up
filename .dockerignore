@@ -7,7 +7,8 @@ __pycache__/
 output/
 Samples/
 context/
-tests/
+# include tests in build context for Docker test image
+# tests/
 *.md
 .env
 alembic/versions/__pycache__/
